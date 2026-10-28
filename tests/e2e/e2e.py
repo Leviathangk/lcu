@@ -229,6 +229,7 @@ def remove_stale_accounts():
 
 class Sandbox:
     def __init__(self, work, label, node, *, guard=False, user=None):
+        self.node = node
         self.root = work / label
         self.root.mkdir(mode=0o755)
         self.home, self.project, self.tmp = self.root / 'home', self.root / 'project', self.root / 'tmp'
@@ -378,16 +379,20 @@ def parse_file(path):
     return {'lines': text.splitlines()}
 
 
-def adapter_copies(release):
-    """sha256 -> path of every file in the installed release's adapters/, for files setup copies verbatim."""
+def release_copies(release):
+    """Exact source identities for files setup copies verbatim from this release."""
     base = Path(release) / 'adapters'
-    return {hashlib.sha256(path.read_bytes()).hexdigest(): str(path.relative_to(base))
-            for path in sorted(base.rglob('*')) if path.is_file() and not path.is_symlink()}
+    copies = {hashlib.sha256(path.read_bytes()).hexdigest(): {'copy-of-adapter': str(path.relative_to(base))}
+              for path in sorted(base.rglob('*')) if path.is_file() and not path.is_symlink()}
+    helper = Path(release) / 'lcu/claude_hook.mjs'
+    if helper.is_file():
+        copies[hashlib.sha256(helper.read_bytes()).hexdigest()] = {'copy-of-runtime': 'lcu/claude_hook.mjs'}
+    return copies
 
 
 def snapshot(root, label, copies=None):
     """Every file, link and empty directory under root as parsed data, keyed by path. A file that is a byte-for-byte
-    copy of one of the release's own adapter files is recorded by that source path: each release ships its own
+    copy of a known release file is recorded by its source path: each release ships its own
     adapters, and they change independently of the port (a newer Hermes plugin on main is not a setup difference)."""
     copies = copies or {}
     found = {}
@@ -402,7 +407,7 @@ def snapshot(root, label, copies=None):
         elif path.is_file():
             source = copies.get(hashlib.sha256(path.read_bytes()).hexdigest())
             found[key] = {'mode': oct(path.stat().st_mode & 0o777),
-                          **({'copy-of-adapter': source} if source else parse_file(path))}
+                          **(source if source else parse_file(path))}
         elif path.is_dir() and not any(path.iterdir()):
             found[key] = {'empty-dir': True}
     return found
@@ -434,6 +439,8 @@ def expected_renames(old):
 # Data the port added on purpose: a NEW-only key whose path ends in the first item and whose value equals the
 # second (or satisfies it, when it is a predicate) is not a difference. Anything else under the key still shows.
 EXPECTED_ADDITIONS = (
+    ('/files/HOME/.local/share/lcu/claude/claude-hook.mjs',
+     {'mode': oct(0o600), 'copy-of-runtime': 'lcu/claude_hook.mjs'}),
     # `lcu status --json` reports the cross-turn Computer Use setting, off by default (docs/releases/0.11.0.md).
     ('/status-json-body/cross_turn', {'enabled': False, 'source': None}),
     # The launcher records what it derived for the original runtime, so that a nested `lcu` derives it again
@@ -444,13 +451,31 @@ EXPECTED_ADDITIONS = (
 )
 
 
+def claude_command_hook(old, event, node):
+    """Only the exact shipped lifecycle handler changes; foreign MCP hooks still compare normally."""
+    if event == 'PreToolUse':
+        legacy = {'type': 'mcp_tool', 'server': 'lcu', 'tool': 'set_turn_context', 'input': {
+            'session_id': '${session_id}', 'turn_id': '${prompt_id}', 'tool_use_id': '${tool_use_id}',
+            'agent_id': '${agent_id}'}}
+    else:
+        legacy = {'type': 'mcp_tool', 'server': 'lcu', 'tool': 'turn_ended', 'input': {
+            'hook_event_name': 'Interrupt' if event == 'StopFailure' else event,
+            'session_id': '${agent_id}' if event == 'SubagentStop' else '${session_id}', 'turn_id': '${prompt_id}'}}
+    return {'type': 'command', 'command': node,
+            'args': ['<SB>/home/.local/share/lcu/claude/claude-hook.mjs'], 'timeout': 600} if old == legacy else old
+
+
 # Data the port changed on purpose: a difference whose path ends in the first item and whose NEW value equals
 # the OLD value with the second applied is not a difference. Anything else under the path still shows.
-EXPECTED_CHANGES = (
+EXPECTED_CHANGES = tuple(
+    (f'/.claude/{settings}/json/hooks/{event}[0]/hooks[0]', lambda old, node, event=event: claude_command_hook(old, event, node))
+    for settings in ('settings.json', 'settings.local.json')
+    for event in ('PreToolUse', 'Stop', 'StopFailure', 'SubagentStop')
+) + (
     # The Pi wrapper imports the adapter by plain path on POSIX so Pi-Bolt's compiler can compile it in
     # (Windows keeps the file:// URL; pull/65).
     ('/.local/share/lcu/pi/extension.mjs/code',
-     lambda old: old.replace('importlcufrom"file://', 'importlcufrom"', 1) if isinstance(old, str) else old),
+     lambda old, _node: old.replace('importlcufrom"file://', 'importlcufrom"', 1) if isinstance(old, str) else old),
 )
 
 
@@ -487,7 +512,8 @@ def expected_new_harnesses(old, new):
 
 # The Claude Code `lcu-approve` mod setup copied into HOME. `lcu update` refreshes it from the new release
 # (docs/INSTALLATION.md#upgrades-and-rollback), and a `--runtime-only` reinstall never runs setup, so after an
-# update and after the rollback it holds the release's own copy, not OLD's.
+# update and after the rollback it holds the release's own copy, not OLD's. The standalone hook helper
+# follows the same rule, copied into account data so a rollback never removes its executable script.
 CLAUDE_MOD = 'HOME/.claude/skills/lcu-approve/'
 CLAUDE_MOD_SETUP_FILES = ('lcu.json',)  # written by setup beside the shipped files, not shipped
 
@@ -495,7 +521,7 @@ CLAUDE_MOD_SETUP_FILES = ('lcu.json',)  # written by setup beside the shipped fi
 def expected_mod(files, release, normalize):
     """`files` with the lcu-approve mod's shipped files replaced by those of the release at `release` (the
     extracted archive), as lcu/claude_mod.mjs copies them: without its tests, keeping the installed file's mode
-    (new files are written 0600)."""
+    (new files are written 0600), plus the standalone lifecycle helper."""
     source = release / 'adapters/claude-mod/lcu-approve'
     shipped = {}
     for path in sorted(source.rglob('*')):
@@ -506,11 +532,17 @@ def expected_mod(files, release, normalize):
                 if not key.startswith(CLAUDE_MOD) or key[len(CLAUDE_MOD):] in CLAUDE_MOD_SETUP_FILES}
     for key, data in shipped.items():
         expected[key] = {'mode': files.get(key, {}).get('mode', oct(0o600)), **data}
+    helper = release / 'lcu/claude_hook.mjs'
+    if helper.is_file():
+        key = 'HOME/.local/share/lcu/claude/claude-hook.mjs'
+        expected[key] = {'mode': files.get(key, {}).get('mode', oct(0o600)), **normalize(parse_file(helper))}
     return expected
 
 
-def diff(old, new, path='', out=None):
+def diff(old, new, path='', out=None, *, claude_node='<SB>/app/chatgpt/resources/cua_node/bin/node'):
     out = [] if out is None else out
+    if any(path.endswith(suffix) and change(old, claude_node) == new for suffix, change in EXPECTED_CHANGES):
+        return out
     if isinstance(old, dict) and isinstance(new, dict):
         for key in sorted(set(old) | set(new), key=str):
             if key not in new:
@@ -521,12 +553,11 @@ def diff(old, new, path='', out=None):
                     continue
                 out.append(f'{path}/{key}: only NEW = {short(new[key])}')
             else:
-                diff(old[key], new[key], f'{path}/{key}', out)
+                diff(old[key], new[key], f'{path}/{key}', out, claude_node=claude_node)
     elif isinstance(old, list) and isinstance(new, list) and len(old) == len(new):
         for index, (a, b) in enumerate(zip(old, new)):
-            diff(a, b, f'{path}[{index}]', out)
-    elif old != new and not any(path.endswith(suffix) and change(old) == new
-                                for suffix, change in EXPECTED_CHANGES):
+            diff(a, b, f'{path}[{index}]', out, claude_node=claude_node)
+    elif old != new:
         out.append(f'{path}: OLD = {short(old)} | NEW = {short(new)}')
     return out
 
@@ -595,7 +626,7 @@ def check_setup(sandbox, impl):
             args = [a.format(project=sandbox.project, home=sandbox.home) for a in args]
             exits.append(sandbox.lcu('setup', *args, '--yes')[0])
         _, commands = sandbox.take_records()
-        copies = adapter_copies((sandbox.prefix / 'current').resolve())
+        copies = release_copies((sandbox.prefix / 'current').resolve())
         data[name] = {'exit': exits, 'commands': commands,
                       'files': {**snapshot(sandbox.home, 'HOME', copies), **snapshot(sandbox.project, 'PROJECT', copies)}}
     return data
@@ -842,7 +873,10 @@ def check_upgrade(sandbox, old, new, mode):
             renamed = version == new.version and old.archive != new.archive  # the self-test compares OLD with itself
             files = expected_renames(before['files']) if renamed else before['files']
             files = expected_mod(files, sandbox.source(new), normalize)  # refreshed by the update, kept by rollback
-            failures.extend(f'{stage}: agent files {line}' for line in diff(files, after['files']))
+            # Setup records the fake app wrapper. Post-install runs on its real Node executable,
+            # so process.execPath is sandbox.node; runtime-only rollback retains those refreshed hooks.
+            failures.extend(f'{stage}: agent files {line}' for line in
+                            diff(files, after['files'], claude_node=normalize(sandbox.node)))
 
     before = observe()
     if agent and (not before['registrations'] or before['missing-paths'] or not before['launch']):

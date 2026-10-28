@@ -29,6 +29,7 @@ import {
 import { crossTurnEnabled } from './cross-turn.mjs';
 import { openDiagnosticLog } from './diagnostics.mjs';
 import { declineAgentHostApp } from './host-guard.mjs';
+import { prepareLifecycle } from '../lcu/claude_lifecycle.mjs';
 
 const PUBLIC_TOOLS = new Set(['js', 'js_reset']);
 const CONTEXT_TOOL = 'set_turn_context';
@@ -45,6 +46,9 @@ const CLAUDE_TOOL_USE_META = 'claudecode/toolUseId';
  * timeouts (20 s per step on macOS) or after an in-flight call.
  */
 export const SHUTDOWN_DRAIN_TIMEOUT_MS = 2_000;
+/** Extra lifecycle wait, also capped by a 28 s total startup deadline to reserve 2 s of Claude's 30 s default. */
+export const LIFECYCLE_WAIT_MS = 2_000;
+export const LIFECYCLE_STARTUP_BUDGET_MS = 28_000;
 /** Live (bound, not yet ended) turns a relay accepts at once. */
 const MAX_LIVE_TURNS = 1024;
 /**
@@ -149,17 +153,20 @@ function nativeForm(params, approval) {
 export async function runClaudeBridge({
   command, args = [], cwd, env, log = openDiagnosticLog({ adapter: 'claude' }),
   shutdownDrainMs = SHUTDOWN_DRAIN_TIMEOUT_MS, crossTurn = () => crossTurnEnabled(),
-  maxEndedTurns = MAX_ENDED_TURNS, appBuild,
+  maxEndedTurns = MAX_ENDED_TURNS, appBuild, lifecycleOptions, lifecycleWaitMs = LIFECYCLE_WAIT_MS,
+  lifecycleStartupBudgetMs = LIFECYCLE_STARTUP_BUDGET_MS,
 } = {}) {
   if (!nonEmptyString(command) || !Array.isArray(args) ||
       args.some(argument => typeof argument !== 'string')) {
     throw new TypeError('Claude bridge requires the original MCP command and string arguments');
   }
 
+  const startupStarted = performance.now();
   const restarts = createAppUpdateRestart({ log,
     build: appBuild ?? (() => selectedAppBuild([command, ...args], { cwd, env: env ?? process.env })) });
   // The current original server: { client, generation }. A restart after an app update replaces it.
   let link;
+  let startingClient;
   let restarting;
   let restartFailure;
   // The original tools the relay lists, from the current original server.
@@ -193,7 +200,7 @@ export async function runClaudeBridge({
     // A turn end that arrives while a restart replaces the original server goes to the fresh one.
     const call = (async () => {
       await settled();
-      if (!link) throw new Error('The original CUA server is not running');
+      if (!link) return { content: [] };
       return link.client.callTool({ name: TURN_END_TOOL, arguments: {
         hook_event_name: event, session_id: sessionId, turn_id: upstreamId,
       } }, undefined, { timeout: TURN_END_TIMEOUT_MS });
@@ -366,8 +373,8 @@ export async function runClaudeBridge({
     const current = lives.get(key);
     if (current) return current;
     if (endedKeys.has(key)) return undefined;
-    // A key this relay never bound is still ended upstream, so record it: a first bind with cross-turn on
-    // must renew instead of forwarding the ended id. The history is bounded oldest-first.
+    // Even an unbound parent must close its prompt and cascade to bound children, as on main.
+    // sendTurnEnded skips the upstream call itself when no upstream exists.
     remember(endedKeys, key);
     const subagent = event === 'SubagentStop';
     return { key, sessionId, turnId, subagent, upstreamId: subagent ? subagentTurnId(sessionId, turnId) : turnId,
@@ -390,16 +397,18 @@ export async function runClaudeBridge({
     client.setRequestHandler(ElicitRequestSchema, (request, extra) => elicitationHandler(request, extra));
     client.onerror = upstreamError;
     const connectStarted = Date.now();
+    startingClient = client;
     try {
-      await client.connect(transport);
+      await client.connect(transport, { signal: lifecycleAbort.signal });
     } catch (error) {
+      if (startingClient === client) startingClient = undefined;
       log.event('upstream_connect', { ms: Date.now() - connectStarted, ok: false });
       await client.close().catch(() => {});
       throw error;
     }
     log.event('upstream_connect', { ms: Date.now() - connectStarted, ok: true });
     try {
-      const upstreamTools = (await client.listTools()).tools;
+      const upstreamTools = (await client.listTools({}, { signal: lifecycleAbort.signal })).tools;
       const tools = upstreamTools.filter(tool => PUBLIC_TOOLS.has(tool.name));
       if (tools.length !== PUBLIC_TOOLS.size ||
           !upstreamTools.some(tool => tool.name === TURN_END_TOOL)) {
@@ -413,6 +422,8 @@ export async function runClaudeBridge({
     } catch (error) {
       await client.close().catch(() => {});
       throw error;
+    } finally {
+      if (startingClient === client) startingClient = undefined;
     }
   }
 
@@ -448,9 +459,184 @@ export async function runClaudeBridge({
     return restarting;
   }
 
+  function bindContext(toolArgs) {
+    if (!link || lifecycleAbort.signal.aborted) {
+      return { isError: true, content: [{ type: 'text',
+        text: `LCU's lifecycle channel failed to start (${lifecycleFailure ?? 'upstream_unavailable'}); ` +
+          'the exact Claude PreToolUse identity is unavailable. LCU did not bind this tool call.' }] };
+    }
+    const context = requireTurnContext(toolArgs);
+    // Match Claude's child cleanup identity while preserving the shared prompt ID.
+    if (context.agentId) context.sessionId = context.agentId;
+    if (!nonEmptyString(context.turnId)) {
+      context.turnId = promptlessTurnId;
+      if (context.agentId) {
+        const bound = promptlessSubagentTurns.get(context.sessionId);
+        const entry = bound && !bound.ended ? bound : { id: promptlessTurnId, ended: false };
+        context.turnId = entry.id;
+        promptlessSubagentTurns.delete(context.sessionId);
+        promptlessSubagentTurns.set(context.sessionId, entry);
+        if (promptlessSubagentTurns.size > maxEndedTurns) {
+          promptlessSubagentTurns.delete(promptlessSubagentTurns.keys().next().value);
+        }
+      }
+    }
+    const previous = contexts.get(context.toolUseId);
+    if (previous && (previous.sessionId !== context.sessionId || previous.turnId !== context.turnId ||
+        previous.agentId !== context.agentId)) {
+      throw new Error('Conflicting Claude identity for the same tool_use_id');
+    }
+    if (!previous && contexts.size >= 1024) {
+      throw new Error('Too many pending Claude tool identities; LCU rejected this call safely');
+    }
+    const key = turnKey(context.sessionId, context.turnId);
+    const subagent = Boolean(context.agentId);
+    const crossOn = crossTurn();
+    let life = lives.get(key);
+    const endedLife = Boolean(life?.endedUpstream);
+    // With cross-turn off, a subagent of an ended prompt shares the ended id and is refused, as before.
+    const sharesEnded = subagent && !crossOn && endedPrompts.has(context.turnId);
+    // A life whose id is already the closed prompt id cannot do better off-mode, so it is reused unless a
+    // cleanup is in flight (the next Stop must start its own).
+    const stale = endedLife && (life.cleanup || crossOn || life.upstreamId !== context.turnId);
+    if (!life || stale || (sharesEnded && life.upstreamId !== context.turnId)) {
+      admit(key);
+      // The key's earlier life already ended upstream (completed, or a cleanup in flight that this bind
+      // supersedes), so with cross-turn on this life needs a fresh upstream turn id. A random UUID, not a
+      // counter, so it needs no state beyond the life record and cannot collide with a prompt id.
+      const renew = crossOn && (endedLife || endedKeys.has(key));
+      if (renew) log.event('turn_renew', { in_flight: Boolean(life?.cleanup), subagent });
+      life = openLife(key, context.sessionId, context.turnId, subagent,
+        renew ? randomUUID() : sharesEnded ? context.turnId
+          : subagent ? subagentTurnId(context.sessionId, context.turnId) : context.turnId);
+    }
+    context.life = life;
+    contexts.set(context.toolUseId, context);
+    return { content: [{ type: 'text', text: 'Turn context bound.' }] };
+  }
+
+  function endContext(toolArgs) {
+    const event = toolArgs.hook_event_name;
+    const promptless = hookWithoutPrompt(toolArgs.turn_id);
+    const life = lifeForHook(toolArgs.session_id,
+      resolveTurnId(toolArgs.session_id, toolArgs.turn_id, event), event);
+    if (promptless && event === 'SubagentStop') {
+      const entry = promptlessSubagentTurns.get(toolArgs.session_id);
+      if (entry) entry.ended = true;
+    }
+    if (promptless && event !== 'SubagentStop') promptlessTurnId = randomUUID();
+    if (!life) return { content: [{ type: 'text', text: 'Turn already ended.' }] };
+    return turnEnded(life, event);
+  }
+
+  let lifecycle;
+  const lifecycleAbort = new AbortController();
+  let lifecycleFailure;
+  const lifecycleFailed = reason => {
+    lifecycleFailure = reason;
+    log.event('lifecycle_listen', { ok: false, reason });
+  };
+  let hostClosed = false;
+  const transport = new StdioServerTransport();
+  const startupMessages = [];
+  // Use the SDK's reader from the start: stdin 'end' requires consumption. Hold decoded messages until
+  // the downstream server is ready; the SDK still owns all framing, validation and protocol behavior.
+  transport.onmessage = message => startupMessages.push(message);
+  const closeUpstreamAfterTurnCleanup = () => {
+    if (shutdown) return shutdown;
+    shutdown = (async () => {
+      // Stop answering probes before aborting children or draining turns.
+      lifecycle?.close();
+      lifecycleAbort.abort();
+      process.stdin.off('end', closeDownstream);
+      await startingClient?.close().catch(() => {});
+      startingClient = undefined;
+      const drain = (async () => {
+        await settled();
+        for (const life of [...lives.values()]) {
+          try {
+            await turnEnded(life, 'Interrupt');
+          } catch (error) {
+            console.error('Claude MCP turn cleanup during shutdown failed:', asError(error));
+          }
+        }
+      })();
+      // Cleanups of superseded lives are still in flight too; give them the same drain window.
+      // Requests submitted while draining (serial cascades) join the wait until none is left.
+      const drainAll = (async () => {
+        await drain;
+        while (pendingEnds.size) await Promise.allSettled([...pendingEnds]);
+      })();
+      let timer;
+      const drained = await Promise.race([drainAll.then(() => true), new Promise(resolve => {
+        timer = setTimeout(resolve, shutdownDrainMs, false);
+      })]);
+      clearTimeout(timer);
+      if (!drained) {
+        console.error(`Claude MCP turn cleanup during shutdown did not finish within ${shutdownDrainMs} ms; ` +
+          'closing the original server');
+        log.event('shutdown_drain', { ms: shutdownDrainMs, outcome: 'timeout' });
+      }
+      // A restart still starting its fresh server closes that one itself once it sees the shutdown.
+      if (connected) {
+        connected = false;
+        try {
+          await link.client.close();
+        } catch (error) {
+          console.error('Claude MCP upstream close failed:', asError(error));
+        }
+        log.event('upstream_close');
+      }
+    })();
+    return shutdown;
+  };
+  const closeDownstream = () => {
+    hostClosed = true;
+    // The host is gone. Closing the server aborts its in-flight calls, which cancels them upstream and
+    // starts their Interrupt cleanup, and its onclose drains the remaining turns before closing upstream.
+    // Draining first would wait for each in-flight call to end on its own.
+    lifecycle?.close();
+    lifecycleAbort.abort();
+    if (server && !serverClose) serverClose = server.close().catch(error => {
+      console.error('Claude MCP relay close failed:', asError(error));
+    });
+    void closeUpstreamAfterTurnCleanup();
+  };
+  process.stdin.once('end', closeDownstream);
+  await transport.start();
+  if (process.stdin.readableEnded) closeDownstream();
+  // Preparation can overlap original-host startup. Publication cannot: its handler requires a live link.
+  const lifecyclePrepared = prepareLifecycle({ ...lifecycleOptions, signal: lifecycleAbort.signal })
+    .catch(error => {
+      if (!lifecycleAbort.signal.aborted) lifecycleFailed(error.lifecycleReason ?? 'listener_failed');
+    });
+  const publishLifecycle = async () => {
+    const publish = await lifecyclePrepared;
+    if (!publish || lifecycleAbort.signal.aborted) return;
+    try {
+      const listener = await publish(hook => {
+        if (hook.hook_event_name === 'PreToolUse') return bindContext({
+          session_id: hook.session_id, turn_id: hook.prompt_id, tool_use_id: hook.tool_use_id, agent_id: hook.agent_id,
+        });
+        const event = hook.hook_event_name === 'StopFailure' ? 'Interrupt' : hook.hook_event_name;
+        return endContext({ hook_event_name: event,
+          session_id: event === 'SubagentStop' ? hook.agent_id : hook.session_id, turn_id: hook.prompt_id });
+      });
+      lifecycle = listener;
+      if (lifecycleAbort.signal.aborted) return listener.close();
+      lifecycleFailure = undefined;
+      log.event('lifecycle_listen', { ok: true });
+    } catch (error) {
+      if (!lifecycleAbort.signal.aborted) lifecycleFailed(error.lifecycleReason ?? 'listener_failed');
+    }
+  };
+
   try {
+    if (hostClosed) { await shutdown; await transport.close(); return; }
     link = await openUpstream();
+    if (hostClosed) { await link.client.close().catch(() => {}); await shutdown; return; }
     connected = true;
+    const lifecycleReady = publishLifecycle();
     ({ publicTools, turnEndedTool } = link);
     const contextTool = {
       name: CONTEXT_TOOL,
@@ -485,54 +671,7 @@ export async function runClaudeBridge({
     server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
       const { name, arguments: toolArgs = {}, _meta } = request.params;
       if (name === CONTEXT_TOOL) {
-        const context = requireTurnContext(toolArgs);
-        // Match Claude's child cleanup identity while preserving the shared prompt ID.
-        if (context.agentId) context.sessionId = context.agentId;
-        if (!nonEmptyString(context.turnId)) {
-          context.turnId = promptlessTurnId;
-          if (context.agentId) {
-            const bound = promptlessSubagentTurns.get(context.sessionId);
-            const entry = bound && !bound.ended ? bound : { id: promptlessTurnId, ended: false };
-            context.turnId = entry.id;
-            promptlessSubagentTurns.delete(context.sessionId);
-            promptlessSubagentTurns.set(context.sessionId, entry);
-            if (promptlessSubagentTurns.size > maxEndedTurns) {
-              promptlessSubagentTurns.delete(promptlessSubagentTurns.keys().next().value);
-            }
-          }
-        }
-        const previous = contexts.get(context.toolUseId);
-        if (previous && (previous.sessionId !== context.sessionId || previous.turnId !== context.turnId ||
-            previous.agentId !== context.agentId)) {
-          throw new Error('Conflicting Claude identity for the same tool_use_id');
-        }
-        if (!previous && contexts.size >= 1024) {
-          throw new Error('Too many pending Claude tool identities; LCU rejected this call safely');
-        }
-        const key = turnKey(context.sessionId, context.turnId);
-        const subagent = Boolean(context.agentId);
-        const crossOn = crossTurn();
-        let life = lives.get(key);
-        const endedLife = Boolean(life?.endedUpstream);
-        // With cross-turn off, a subagent of an ended prompt shares the ended id and is refused, as before.
-        const sharesEnded = subagent && !crossOn && endedPrompts.has(context.turnId);
-        // A life whose id is already the closed prompt id cannot do better off-mode, so it is reused unless a
-        // cleanup is in flight (the next Stop must start its own).
-        const stale = endedLife && (life.cleanup || crossOn || life.upstreamId !== context.turnId);
-        if (!life || stale || (sharesEnded && life.upstreamId !== context.turnId)) {
-          admit(key);
-          // The key's earlier life already ended upstream (completed, or a cleanup in flight that this bind
-          // supersedes), so with cross-turn on this life needs a fresh upstream turn id. A random UUID, not a
-          // counter, so it needs no state beyond the life record and cannot collide with a prompt id.
-          const renew = crossOn && (endedLife || endedKeys.has(key));
-          if (renew) log.event('turn_renew', { in_flight: Boolean(life?.cleanup), subagent });
-          life = openLife(key, context.sessionId, context.turnId, subagent,
-            renew ? randomUUID() : sharesEnded ? context.turnId
-              : subagent ? subagentTurnId(context.sessionId, context.turnId) : context.turnId);
-        }
-        context.life = life;
-        contexts.set(context.toolUseId, context);
-        return { content: [{ type: 'text', text: 'Turn context bound.' }] };
+        return bindContext(toolArgs);
       }
       if (MOD_ONLY_TOOLS.has(name)) {
         // Host-only: answered for the lcu-approve mod, which Claude Code marks with a plugin tool-use id.
@@ -549,17 +688,7 @@ export async function runClaudeBridge({
         return { content: [{ type: 'text', text: JSON.stringify(body) }] };
       }
       if (name === TURN_END_TOOL) {
-        const event = toolArgs.hook_event_name;
-        const promptless = hookWithoutPrompt(toolArgs.turn_id);
-        const life = lifeForHook(toolArgs.session_id,
-          resolveTurnId(toolArgs.session_id, toolArgs.turn_id, event), event);
-        if (promptless && event === 'SubagentStop') {
-          const entry = promptlessSubagentTurns.get(toolArgs.session_id);
-          if (entry) entry.ended = true;
-        }
-        if (promptless && event !== 'SubagentStop') promptlessTurnId = randomUUID();
-        if (!life) return { content: [{ type: 'text', text: 'Turn already ended.' }] };
-        return turnEnded(life, event);
+        return endContext(toolArgs);
       }
       if (!PUBLIC_TOOLS.has(name)) {
         return { isError: true, content: [{ type: 'text', text: `Unknown LCU tool: ${name}` }] };
@@ -568,8 +697,11 @@ export async function runClaudeBridge({
       const toolUseId = _meta?.[CLAUDE_TOOL_USE_META];
       const context = nonEmptyString(toolUseId) ? contexts.get(toolUseId) : undefined;
       if (!context || context.toolUseId !== toolUseId) {
-        return { isError: true, content: [{ type: 'text', text:
-          'Missing exact Claude PreToolUse identity; LCU did not run this tool call.' }] };
+        log.event('identity_refused', { tool: name, reason: lifecycleFailure ?? 'missing_pre_tool_use' });
+        return { isError: true, content: [{ type: 'text', text: lifecycleFailure
+          ? `LCU's lifecycle channel failed to start (${lifecycleFailure}); ` +
+            'the exact Claude PreToolUse identity is unavailable. LCU did not run this tool call.'
+          : 'Missing exact Claude PreToolUse identity; LCU did not run this tool call.' }] };
       }
       contexts.delete(toolUseId);
       // A call that arrives while a restart replaces the original server runs on the fresh one.
@@ -671,64 +803,31 @@ export async function runClaudeBridge({
       }
     }
 
-    const closeUpstreamAfterTurnCleanup = () => {
-      if (shutdown) return shutdown;
-      shutdown = (async () => {
-        const drain = (async () => {
-          await settled();
-          for (const life of [...lives.values()]) {
-            try {
-              await turnEnded(life, 'Interrupt');
-            } catch (error) {
-              console.error('Claude MCP turn cleanup during shutdown failed:', asError(error));
-            }
-          }
-        })();
-        // Cleanups of superseded lives are still in flight too; give them the same drain window.
-        // Requests submitted while draining (serial cascades) join the wait until none is left.
-        const drainAll = (async () => {
-          await drain;
-          while (pendingEnds.size) await Promise.allSettled([...pendingEnds]);
-        })();
-        let timer;
-        const drained = await Promise.race([drainAll.then(() => true), new Promise(resolve => {
-          timer = setTimeout(resolve, shutdownDrainMs, false);
-        })]);
-        clearTimeout(timer);
-        if (!drained) {
-          console.error(`Claude MCP turn cleanup during shutdown did not finish within ${shutdownDrainMs} ms; ` +
-            'closing the original server');
-          log.event('shutdown_drain', { ms: shutdownDrainMs, outcome: 'timeout' });
-        }
-        // A restart still starting its fresh server closes that one itself once it sees the shutdown.
-        if (connected) {
-          connected = false;
-          try {
-            await link.client.close();
-          } catch (error) {
-            console.error('Claude MCP upstream close failed:', asError(error));
-          }
-          log.event('upstream_close');
-        }
-      })();
-      return shutdown;
-    };
     server.onclose = () => { void closeUpstreamAfterTurnCleanup(); };
-    const transport = new StdioServerTransport();
-    const closeDownstream = () => {
-      // The host is gone. Closing the server aborts its in-flight calls, which cancels them upstream and
-      // starts their Interrupt cleanup, and its onclose drains the remaining turns before closing upstream.
-      // Draining first would wait for each in-flight call to end on its own.
-      if (!serverClose) serverClose = server.close().catch(error => {
-        console.error('Claude MCP relay close failed:', asError(error));
-      });
-      void closeUpstreamAfterTurnCleanup();
+    // Keep MCP diagnosable if lifecycle setup fails or exceeds this extra budget. Do not abort on
+    // timeout: a late ACL success still publishes, so the next PreToolUse can recover without a restart.
+    let lifecycleTimer;
+    let stopWaiting;
+    try {
+      await Promise.race([lifecycleReady, new Promise(resolve => {
+        const remaining = Math.max(0, Math.min(lifecycleWaitMs,
+          lifecycleStartupBudgetMs - (performance.now() - startupStarted)));
+        lifecycleTimer = setTimeout(() => { lifecycleFailed('startup_timeout'); resolve(); }, remaining);
+        stopWaiting = resolve;
+        lifecycleAbort.signal.addEventListener('abort', stopWaiting, { once: true });
+      })]);
+    } finally {
+      clearTimeout(lifecycleTimer);
+      lifecycleAbort.signal.removeEventListener('abort', stopWaiting);
+    }
+    if (hostClosed) { await shutdown; await transport.close(); return; }
+    // Transfer the already-started SDK transport to the server. connect() calls start() again; replay the
+    // SDK-decoded startup messages there, after connect installs the server's protocol callbacks.
+    transport.onmessage = undefined;
+    transport.start = async () => {
+      for (const message of startupMessages.splice(0)) transport.onmessage?.(message);
     };
     await server.connect(transport);
-    // The SDK's stdio server transport owns MCP framing but does not surface stdin EOF.
-    // EOF is the actual Claude-side connection-close signal; use it to drain exact
-    // active turns before closing the original MCP client.
-    process.stdin.once('end', closeDownstream);
     return { server, get upstream() { return link?.client; }, contexts, activeTurns: lives, close: async () => {
       process.stdin.off('end', closeDownstream);
       await closeUpstreamAfterTurnCleanup();
@@ -736,7 +835,13 @@ export async function runClaudeBridge({
       await serverClose;
     } };
   } catch (error) {
+    lifecycle?.close();
+    lifecycleAbort.abort();
+    process.stdin.off('end', closeDownstream);
+    await transport.close().catch(() => {});
+    await server?.close().catch(() => {});
     if (connected) await link.client.close().catch(() => {});
+    if (hostClosed) { await shutdown; await transport.close(); return; }
     throw error;
   }
 }
